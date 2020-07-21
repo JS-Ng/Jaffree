@@ -18,10 +18,11 @@
 package com.github.kokorin.jaffree.ffmpeg;
 
 import com.github.kokorin.jaffree.LogLevel;
+import com.github.kokorin.jaffree.StreamType;
 import com.github.kokorin.jaffree.process.LoggingStdReader;
 import com.github.kokorin.jaffree.process.ProcessHandler;
 import com.github.kokorin.jaffree.process.StdReader;
-import com.github.kokorin.jaffree.process.StdWriter;
+import com.github.kokorin.jaffree.process.Stopper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -29,9 +30,10 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.Callable;
-import java.util.concurrent.Future;
 import java.util.concurrent.FutureTask;
 
 public class FFmpeg {
@@ -45,8 +47,11 @@ public class FFmpeg {
     //-filter_threads nb_threads (global)
     //-debug_ts (global)
     private FilterGraph complexFilter;
-    // TODO audio and video specific filters: -vf and -af
-    private String filter;
+
+    /**
+     * A map with 0 or 1 filter per stream type. Type can be "a" (audio), "v" (video) or "" (plain 'filter')
+     */
+    private final Map<String, Object> filters = new HashMap<>();
 
     private LogLevel logLevel = null;
     private String contextName = null;
@@ -79,8 +84,78 @@ public class FFmpeg {
         return this;
     }
 
+    /**
+     * Sets the 'generic' filter value (equivalent to the "-filter" command-line parameter).
+     *
+     * @param filter a String describing the filter to apply
+     * @return this
+     */
     public FFmpeg setFilter(String filter) {
-        this.filter = filter;
+        return setFilter("", filter);
+    }
+
+    /**
+     * Sets the 'generic' filter value (equivalent to the "-filter" command-line parameter).
+     *
+     * @param filter a FilterGraph describing the filter to apply
+     * @return this
+     */
+    public FFmpeg setFilter(FilterGraph filter) {
+        return setFilter("", filter.getValue());
+    }
+
+    /**
+     * Sets a 'stream specific' filter value (equivalent to the "-av" / "-filter:a" or "-fv" / "-filter:v" command-line parameters).
+     *
+     * @param streamType  the stream type to apply this filter to (StreamType.AUDIO or StreamType.VIDEO)
+     * @param filterGraph a graph describing the filters to apply
+     * @return this
+     */
+    public FFmpeg setFilter(StreamType streamType, FilterGraph filterGraph) {
+        return setFilter(streamType.code(), filterGraph.getValue());
+    }
+
+    /**
+     * Sets a 'stream specific' filter value (equivalent to the "-av" / "-filter:a" or "-fv" / "-filter:v" command-line parameters).
+     *
+     * @param streamType the stream type to apply this filter to (StreamType.AUDIO or StreamType.VIDEO)
+     * @param filter     a String describing the filter to apply
+     * @return this
+     */
+    public FFmpeg setFilter(StreamType streamType, String filter) {
+        return setFilter(streamType.code(), filter);
+    }
+
+    /**
+     * Sets a 'stream specific' filter value (equivalent to the "-av" / "-filter:a" or "-fv" / "-filter:v" / "-filter" command-line parameters).
+     *
+     * @param streamSpecifier a String specifying to which stream this filter must be applied ("a" for audio, "v" "for video, or "" for generic 'filter')
+     * @param filterGraph     a graph describing the filters to apply
+     * @return this
+     */
+    public FFmpeg setFilter(String streamSpecifier, FilterGraph filterGraph) {
+        return setFilter(streamSpecifier, filterGraph.getValue());
+    }
+
+    /**
+     * Sets a 'stream specific' filter value (equivalent to the "-av" / "-filter:a" or "-fv" / "-filter:v" / "-filter" command-line parameters).
+     *
+     * @param streamSpecifier a String specifying to which stream this filter must be applied ("a" for audio, "v" "for video, or "" for generic 'filter')
+     * @param filter          a String describing the filter to apply
+     * @return this
+     */
+    public FFmpeg setFilter(String streamSpecifier, String filter) {
+        // If a previous filter was set, warn that it is replaced by the new one
+        final String previousFilter = (String) filters.get(streamSpecifier);
+        if (previousFilter != null) {
+            if (streamSpecifier.isEmpty()) {
+                LOGGER.warn("Only one generic filter is supported. Ignoring previous filter '" + previousFilter + "'.");
+            } else {
+                LOGGER.error("Only one filter per stream is supported. Ignoring previous filter '" + previousFilter + "' for stream '" + streamSpecifier + "'.");
+            }
+        }
+        // Store the new filter
+        filters.put(streamSpecifier, filter);
         return this;
     }
 
@@ -103,6 +178,7 @@ public class FFmpeg {
 
     /**
      * Supply custom ProgressListener to receive progress events
+     *
      * @param progressListener listener
      * @return this
      */
@@ -113,6 +189,7 @@ public class FFmpeg {
 
     /**
      * Supply custom OutputListener to receive ffmpeg output.
+     *
      * @param outputListener listener
      * @return this
      */
@@ -138,6 +215,36 @@ public class FFmpeg {
     }
 
     public FFmpegResult execute() {
+        ProcessHandler<FFmpegResult> processHandler = createProcessHandler();
+        return processHandler.execute();
+    }
+
+    /**
+     * Runs ffmpeg in separate Thread.
+     * <p>
+     *
+     * @return ffmpeg result future
+     */
+    public FFmpegResultFuture executeAsync() {
+        final ProcessHandler<FFmpegResult> processHandler = createProcessHandler();
+        Stopper stopper = createStopper();
+        processHandler.setStopper(stopper);
+
+        FutureTask<FFmpegResult> resultFuture = new FutureTask<>(new Callable<FFmpegResult>() {
+            @Override
+            public FFmpegResult call() throws Exception {
+                return processHandler.execute();
+            }
+        });
+
+        Thread runner = new Thread(resultFuture, "FFmpeg-async-runner");
+        runner.setDaemon(true);
+        runner.start();
+
+        return new FFmpegResultFuture(resultFuture, stopper);
+    }
+
+    protected ProcessHandler<FFmpegResult> createProcessHandler() {
         List<Runnable> helpers = new ArrayList<>();
 
         for (Input input : inputs) {
@@ -154,40 +261,14 @@ public class FFmpeg {
         }
 
         return new ProcessHandler<FFmpegResult>(executable, contextName)
-                .setStdInWriter(createStdInWriter())
                 .setStdErrReader(createStdErrReader())
                 .setStdOutReader(createStdOutReader())
                 .setRunnables(helpers)
-                .execute(buildArguments());
+                .setArguments(buildArguments());
     }
 
-    /**
-     * Runs ffmpeg in separate Thread.
-     * <p>
-     * <b>Note</b>: execution is started immediately, so invocation of <code>Future.cancel(false)</code> has no effect.
-     * Use <code>Future.cancel(true)</code>
-     *
-     * @return ffmpeg result future
-     */
-    public Future<FFmpegResult> executeAsync() {
-        Callable<FFmpegResult> callable = new Callable<FFmpegResult>() {
-            @Override
-            public FFmpegResult call() throws Exception {
-                return execute();
-            }
-        };
-
-        final FutureTask<FFmpegResult> result = new FutureTask<>(callable);
-
-        Thread runner = new Thread(result, "FFmpeg-async-runner");
-        runner.setDaemon(true);
-        runner.start();
-
-        return result;
-    }
-
-    protected StdWriter createStdInWriter() {
-        return null;
+    protected Stopper createStopper() {
+        return new FFmpegStopper();
     }
 
     protected StdReader<FFmpegResult> createStdErrReader() {
@@ -224,9 +305,7 @@ public class FFmpeg {
             result.addAll(Arrays.asList("-filter_complex", complexFilter.getValue()));
         }
 
-        if (filter != null) {
-            result.addAll(Arrays.asList("-filter", filter));
-        }
+        result.addAll(BaseInOut.toArguments("-filter", filters));
 
         result.addAll(additionalArguments);
 
